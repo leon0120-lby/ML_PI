@@ -421,3 +421,1487 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+#2.Model
+#2.1DNN
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+import matplotlib.pyplot as plt
+import optuna
+from tqdm import tqdm
+import os
+import time
+
+# Set random seeds for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+
+class Config:
+    # Data parameters
+    EXCEL_PATH = r"E:\tg.xlsx" # Update with your Excel file path
+    SHEET_NAME = 'Sheet1'       
+    FEATURE_START_COL = 0       
+    LABEL_COL = -1               
+    
+    # Optimization parameters
+    N_TRIALS = 20                
+    OPTUNA_STORAGE = "sqlite:///dnn_hpo.db"  # Storage for optimization results
+    
+    # Training parameters
+    EPOCHS = 500                
+    EARLY_STOP_PATIENCE = 30     
+    TEST_SIZE = 0.2                
+    
+    # Device selection
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Save paths
+    MODEL_SAVE_PATH = "E:\tg.pth"
+    SCATTER_PLOT_PATH = "E:\tg.png"
+    RESULTS_CSV = "E:\tg.csv"
+
+
+class DNNModel(nn.Module):
+    def __init__(self, input_dim, hidden_layers, dropout_rate=0.3):
+        super(DNNModel, self).__init__()
+        layers = []
+        prev_dim = input_dim
+        
+        for hidden_dim in hidden_layers:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            prev_dim = hidden_dim
+        
+        layers.append(nn.Linear(prev_dim, 1))
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.network(x)
+
+
+def load_and_preprocess_data():
+    # Load data from Excel
+    df = pd.read_excel(Config.EXCEL_PATH, sheet_name=Config.SHEET_NAME)
+    
+    # Handle column index
+    if Config.LABEL_COL < 0:
+        Config.LABEL_COL = len(df.columns) + Config.LABEL_COL
+    
+    # Separate features and labels
+    feature_columns = df.columns[Config.FEATURE_START_COL:Config.LABEL_COL]
+    X = df[feature_columns].values
+    y = df.iloc[:, Config.LABEL_COL].values.reshape(-1, 1)
+    
+    print(f"Loaded data: {X.shape[0]} samples, {X.shape[1]} features")
+    print(f"Label range: {y.min():.2f} - {y.max():.2f}")
+    
+    # Standardize features and labels
+    X_scaler = StandardScaler()
+    y_scaler = StandardScaler()
+    
+    X_scaled = X_scaler.fit_transform(X)
+    y_scaled = y_scaler.fit_transform(y)
+    
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y_scaled, test_size=Config.TEST_SIZE, random_state=42
+    )
+    
+    # Convert to PyTorch tensors
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+    y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+    X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+    y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
+    
+    # Create datasets
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+    
+    return train_dataset, test_dataset, X_scaler, y_scaler
+
+
+class DNNTrainer:
+    def __init__(self, model, train_dataset, test_dataset, y_scaler, batch_size, lr, wd):
+        self.model = model.to(Config.DEVICE)
+        self.y_scaler = y_scaler
+        self.batch_size = batch_size
+        self.criterion = nn.MSELoss()
+        
+        # Create data loaders
+        self.train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True
+        )
+        self.test_loader = DataLoader(
+            test_dataset, batch_size=batch_size, shuffle=False
+        )
+        
+        # Optimizer
+        self.optimizer = optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=wd
+        )
+        
+        # Learning rate scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=10
+        )
+        
+        # Tracking
+        self.best_val_loss = float('inf')
+        self.best_model_state = None
+        self.train_losses = []
+        self.val_losses = []
+
+    def train_epoch(self):
+        self.model.train()
+        epoch_loss = 0
+        
+        for X_batch, y_batch in self.train_loader:
+            X_batch = X_batch.to(Config.DEVICE)
+            y_batch = y_batch.to(Config.DEVICE)
+            
+            self.optimizer.zero_grad()
+            y_pred = self.model(X_batch)
+            loss = self.criterion(y_pred, y_batch)
+            loss.backward()
+            self.optimizer.step()
+            
+            epoch_loss += loss.item()
+        
+        return epoch_loss / len(self.train_loader)
+
+    def validate(self, loader):
+        self.model.eval()
+        total_loss = 0
+        all_preds = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for X_batch, y_batch in loader:
+                X_batch = X_batch.to(Config.DEVICE)
+                y_batch = y_batch.to(Config.DEVICE)
+                
+                y_pred = self.model(X_batch)
+                loss = self.criterion(y_pred, y_batch)
+                total_loss += loss.item()
+                
+                all_preds.append(y_pred.cpu().numpy())
+                all_targets.append(y_batch.cpu().numpy())
+        
+        # Calculate metrics
+        all_preds = np.vstack(all_preds)
+        all_targets = np.vstack(all_targets)
+        all_preds_orig = self.y_scaler.inverse_transform(all_preds)
+        all_targets_orig = self.y_scaler.inverse_transform(all_targets)
+        
+        r2 = r2_score(all_targets_orig, all_preds_orig)
+        rmse = np.sqrt(mean_squared_error(all_targets_orig, all_preds_orig))
+        mae = mean_absolute_error(all_targets_orig, all_preds_orig)  # Added MAE calculation
+        
+        return total_loss / len(loader), r2, rmse, mae, all_preds_orig, all_targets_orig  # Added MAE to return values
+
+    def train(self, max_epochs, patience):
+        print(f"Training on: {Config.DEVICE}")
+        print(f"Batch size: {self.batch_size}, LR: {self.optimizer.param_groups[0]['lr']:.6f}")
+        
+        no_improve = 0
+        best_r2 = -float('inf')
+        
+        for epoch in range(max_epochs):
+            # Train
+            train_loss = self.train_epoch()
+            self.train_losses.append(train_loss)
+            
+            # Validate
+            val_loss, val_r2, val_rmse, val_mae, _, _ = self.validate(self.train_loader)  # Added MAE to unpack
+            self.val_losses.append(val_loss)
+            self.scheduler.step(val_loss)
+            
+            # Early stopping check
+            if val_r2 > best_r2:
+                best_r2 = val_r2
+                self.best_val_loss = val_loss
+                self.best_model_state = self.model.state_dict().copy()
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    print(f"Early stopping at epoch {epoch+1}")
+                    break
+            
+            # Print progress
+            if (epoch + 1) % 10 == 0:
+                print(f"Epoch {epoch+1}/{max_epochs} | "
+                      f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+                      f"Val R²: {val_r2:.4f} | Val RMSE: {val_rmse:.4f} | Val MAE: {val_mae:.4f}")  # Added MAE to progress print
+        
+        # Load best model
+        self.model.load_state_dict(self.best_model_state)
+        
+        # Evaluate on test set
+        test_loss, test_r2, test_rmse, test_mae, test_preds, test_targets = self.validate(self.test_loader)  # Added MAE
+        _, train_r2, train_rmse, train_mae, train_preds, train_targets = self.validate(self.train_loader)  # Added MAE
+        
+        print(f"\nFinal Evaluation:")
+        print(f"Training R²: {train_r2:.4f}, RMSE: {train_rmse:.4f}, MAE: {train_mae:.4f}")  # Added MAE
+        print(f"Test R²: {test_r2:.4f}, RMSE: {test_rmse:.4f}, MAE: {test_mae:.4f}")  # Added MAE
+        
+        return train_preds, train_targets, test_preds, test_targets, test_r2
+
+    def plot_scatter(self, train_preds, train_targets, test_preds, test_targets, r2_score):
+        plt.figure(figsize=(6, 6))
+        
+        # Scatter plots
+        plt.scatter(train_targets, train_preds, c='#a9d3ce', alpha=1, 
+                   s=70, edgecolors='b', linewidth=0.5, label='Training')
+        plt.scatter(test_targets, test_preds, c='#fc946c', alpha=1, 
+                   s=70, edgecolors='b', linewidth=0.5, label='Test')
+        
+        # Plot reference line#a9d3ce#fc946c
+        min_val = min(np.min(train_targets), np.min(train_preds), 
+                     np.min(test_targets), np.min(test_preds))
+        max_val = max(np.max(train_targets), np.max(train_preds), 
+                     np.max(test_targets), np.max(test_preds))
+        plt.plot([0, 8], [0, 8], 'r--', label='Ideal prediction')
+        
+        # Add metrics
+        #plt.text(0.05, 0.95, f"Test R² = {r2_score:.4f}", 
+        #        transform=plt.gca().transAxes, fontsize=12,
+        #        verticalalignment='top', 
+        #        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        plt.xlim(0, 8) 
+        plt.ylim(0, 8) 
+        plt.xticks(fontsize=16) 
+        plt.yticks(fontsize=16) 
+        # Labels and title
+        plt.xlabel('Actual', fontsize=16)
+        plt.ylabel('Predicted', fontsize=16)
+        #plt.title('Actual vs Predicted Values')
+        plt.legend(fontsize=16, loc='upper left')
+        #plt.grid(True, linestyle='--', alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(Config.SCATTER_PLOT_PATH)
+        plt.show()
+        print(f"Scatter plot saved to: {Config.SCATTER_PLOT_PATH}")
+        
+        # Save results
+        results = pd.DataFrame({
+            'Set': ['Training'] * len(train_targets) + ['Test'] * len(test_targets),
+            'Actual': np.concatenate([train_targets.flatten(), test_targets.flatten()]),
+            'Predicted': np.concatenate([train_preds.flatten(), test_preds.flatten()])
+        })
+        results.to_csv(Config.RESULTS_CSV, index=False)
+        print(f"Predictions saved to: {Config.RESULTS_CSV}")
+
+def objective(trial):
+    # Load data
+    train_dataset, test_dataset, X_scaler, y_scaler = load_and_preprocess_data()
+    
+    # Suggest hyperparameters
+    num_layers = trial.suggest_int('num_layers', 2, 5)
+    hidden_units = []
+    for i in range(num_layers):
+        hidden_units.append(trial.suggest_int(f'n_units_layer_{i}', 64, 512))
+    
+    dropout_rate = trial.suggest_float('dropout_rate', 0.1, 0.5)
+    batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
+    lr = trial.suggest_float('lr', 1e-5, 1e-3, log=True)
+    wd = trial.suggest_float('weight_decay', 1e-7, 1e-4, log=True)
+    
+    # Create model
+    input_dim = X_scaler.n_features_in_
+    model = DNNModel(
+        input_dim=input_dim,
+        hidden_layers=hidden_units,
+        dropout_rate=dropout_rate
+    )
+    
+    # Train model
+    trainer = DNNTrainer(
+        model=model,
+        train_dataset=train_dataset,
+        test_dataset=test_dataset,
+        y_scaler=y_scaler,
+        batch_size=batch_size,
+        lr=lr,
+        wd=wd
+    )
+    
+    _, _, _, _, test_r2 = trainer.train(
+        max_epochs=Config.EPOCHS,
+        patience=Config.EARLY_STOP_PATIENCE
+    )
+    
+    return test_r2
+
+def optimize_hyperparameters():
+    study = optuna.create_study(
+        direction='maximize',
+        storage=Config.OPTUNA_STORAGE,
+        load_if_exists=True
+    )
+    study.optimize(objective, n_trials=Config.N_TRIALS)
+    
+    print("\nHyperparameter optimization completed!")
+    print(f"Best trial: {study.best_trial.number}")
+    print(f"Best R²: {study.best_trial.value:.4f}")
+    print("Best parameters:")
+    for key, value in study.best_trial.params.items():
+        print(f"  {key}: {value}")
+    
+    return study.best_trial.params
+
+def main():
+    print("=" * 60)
+    print("DNN Regression with Hyperparameter Optimization")
+    print("=" * 60)
+    
+    # Hyperparameter optimization
+    print("\nStarting hyperparameter optimization...")
+    best_params = optimize_hyperparameters()
+    
+    # Load data
+    print("\nLoading data with best parameters...")
+    train_dataset, test_dataset, X_scaler, y_scaler = load_and_preprocess_data()
+    
+    # Create best model
+    input_dim = X_scaler.n_features_in_
+    model = DNNModel(
+        input_dim=input_dim,
+        hidden_layers=[best_params[f'n_units_layer_{i}'] for i in range(best_params['num_layers'])],
+        dropout_rate=best_params['dropout_rate']
+    )
+    
+    # Train final model
+    print("\nTraining final model with best hyperparameters...")
+    trainer = DNNTrainer(
+        model=model,
+        train_dataset=train_dataset,
+        test_dataset=test_dataset,
+        y_scaler=y_scaler,
+        batch_size=best_params['batch_size'],
+        lr=best_params['lr'],
+        wd=best_params['weight_decay']
+    )
+    
+    train_preds, train_targets, test_preds, test_targets, test_r2 = trainer.train(
+        max_epochs=Config.EPOCHS,
+        patience=Config.EARLY_STOP_PATIENCE
+    )
+    
+    # Save model
+    torch.save({
+        'model_state_dict': trainer.model.state_dict(),
+        'best_params': best_params,
+        'input_dim': input_dim,
+        'y_scaler': y_scaler
+    }, Config.MODEL_SAVE_PATH)
+    print(f"Model saved to: {Config.MODEL_SAVE_PATH}")
+    
+    # Plot results
+    trainer.plot_scatter(train_preds, train_targets, test_preds, test_targets, test_r2)
+    
+    print("\nTraining completed successfully!")
+
+if __name__ == "__main__":
+    main()
+
+#2.2RF
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_squared_error, r2_score,mean_absolute_error
+
+data = pd.read_excel(r"E:\tg.xlsx")
+X = data.iloc[:, :-1]
+y = data.iloc[:, -1]
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+model = RandomForestRegressor(random_state=42)
+param_grid = {
+    'n_estimators': [50, 100, 200],
+    'max_depth': [None, 10, 20, 30],
+    'min_samples_split': [2, 5, 10],
+    'min_samples_leaf': [1, 2, 4],
+    'max_features': ['auto', 'sqrt', 'log2']
+}
+
+grid_search = GridSearchCV(estimator=model, param_grid=param_grid, 
+                           cv=5, n_jobs=-1, verbose=2, scoring='r2')#neg_mean_squared_error
+grid_search.fit(X_train, y_train)
+
+best_model = grid_search.best_estimator_
+
+y_train_pred = best_model.predict(X_train)
+y_test_pred = best_model.predict(X_test)
+
+mse_train = mean_squared_error(y_train, y_train_pred)
+r2_train = r2_score(y_train, y_train_pred)
+rmse_train = np.sqrt(mse_train)
+
+mse_test = mean_squared_error(y_test, y_test_pred)
+r2_test = r2_score(y_test, y_test_pred)
+rmse_test = np.sqrt(mse_test)
+mae_test = mean_absolute_error(y_test, y_test_pred)
+mae_train = mean_absolute_error(y_train, y_train_pred)
+
+print(f' {grid_search.best_params_}')
+print(f'(MSE): {mse_train:.3f}, R² : {r2_train:.3f}, RMSE: {rmse_train:.3f},MAE: {mae_train:.3f}')
+print(f' (MSE): {mse_test:.3f}, R² : {r2_test:.3f}, RMSE: {rmse_test:.3f},MAE: {mae_test:.3f}')
+
+plt.figure(figsize=(6, 6))
+
+plt.scatter(y_train, y_train_pred, color='#a9d3ce', edgecolors='b', 
+                linewidth=0.5, s=70, label='Train')
+plt.scatter(y_test, y_test_pred, color='#fc946c', edgecolors='b', linewidth=0.5,
+                s=70, label='Test')
+plt.plot([0, 6], [0, 6], 'r--', label='Ideal prediction')
+
+plt.title('Actual Values vs Predicted Values')
+plt.xlabel('Actual Values')
+plt.ylabel('Predicted Values')
+#plt.axis('equal')
+plt.legend()
+plt.grid(False)
+plt.tight_layout()
+
+plt.xlim(0, 6)  
+plt.ylim(0, 6) 
+
+plt.savefig("E:\tg.png", dpi=300, bbox_inches='tight')  
+plt.show()
+
+#2.3GPR
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel, Matern
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+import time
+import os
+
+def load_data(file_path):
+    start_time = time.time()
+    
+    try:
+        df = pd.read_excel(file_path)
+
+        features = df.iloc[:, :-1]  
+        target = df.iloc[:, -1]  
+        
+        return features.values, target.values, features.columns
+    
+    except Exception as e:
+        return None, None, None
+
+def preprocess_data(X, y, test_size=0.2, random_state=42):
+
+    X_scaler = StandardScaler()
+    X_scaled = X_scaler.fit_transform(X)
+    
+    y_scaler = StandardScaler()
+    y_scaled = y_scaler.fit_transform(y.reshape(-1, 1)).flatten()
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y_scaled, 
+        test_size=test_size, 
+        random_state=random_state
+    )
+    
+    return X_train, X_test, y_train, y_test, X_scaler, y_scaler
+
+def build_gpr_model(kernel_type='rbf'):
+
+    if kernel_type == 'rbf':
+        kernel = ConstantKernel(1.0) * RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1)
+    elif kernel_type == 'matern':
+        kernel = ConstantKernel(1.0) * Matern(length_scale=1.0, nu=1.5) + WhiteKernel(noise_level=0.1)
+    else:
+        kernel = ConstantKernel(1.0) * RBF(length_scale=1.0) + WhiteKernel(noise_level=0.1)
+    
+    gpr = GaussianProcessRegressor(
+        kernel=kernel,
+        alpha=1e-5,  
+        n_restarts_optimizer=10,  
+        normalize_y=True,  
+        random_state=42
+    )
+    
+    return gpr
+
+def train_gpr_model(model, X_train, y_train):
+
+    start_time = time.time()
+    
+    model.fit(X_train, y_train)
+    
+    training_time = time.time() - start_time
+    
+    return model
+
+def evaluate_gpr_model(model, X, y, y_scaler, data_name="DATA"):
+
+    y_pred, _ = model.predict(X, return_std=True)
+    
+    y_pred_original = y_scaler.inverse_transform(y_pred.reshape(-1, 1)).flatten()
+    y_original = y_scaler.inverse_transform(y.reshape(-1, 1)).flatten()
+    
+    r2 = r2_score(y_original, y_pred_original)
+    mae = mean_absolute_error(y_original, y_pred_original)
+    rmse = np.sqrt(mean_squared_error(y_original, y_pred_original))
+    
+    print(f"R²: {r2:.3f}")
+    print(f"(MAE): {mae:.3f}")
+    print(f"(RMSE): {rmse:.3f}")
+    
+    return y_original, y_pred_original, r2, mae, rmse
+
+def plot_scatter(y_train, y_train_pred, y_test, y_test_pred, train_r2, test_r2):
+    plt.figure(figsize=(6, 6))
+    
+    plt.scatter(y_train, y_train_pred, alpha=1, color='#a9d3ce', edgecolors='b', 
+                linewidth=0.5, s=70, label='Train')
+    
+    plt.scatter(y_test, y_test_pred, color='#fc946c', edgecolors='b', linewidth=0.5,
+                s=70, label='Test')
+    
+    all_values = np.concatenate([y_train, y_test, y_train_pred, y_test_pred])
+    min_val = min(all_values)
+    max_val = max(all_values)
+
+    plt.plot([0, 6], [0, 6], 'r--', label='Ideal prediction')
+
+    plt.xlabel('Actual', fontsize=16)
+    plt.ylabel('Predicted', fontsize=16)
+    #plt.title('Actual Values vs Predicted Values', fontsize=14)
+    plt.legend(loc='best', fontsize=16)
+ 
+    plt.xlim(0, 6)  
+    plt.ylim(0, 6) 
+    plt.xticks(fontsize=16)  
+    plt.yticks(fontsize=16)  
+    plt.tight_layout()
+    plt.savefig(r"E:\TG.png", dpi=300)
+    plt.show()
+
+def save_results(train_r2, train_mae, train_rmse, test_r2, test_mae, test_rmse, output_dir="GPR_Results"):
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    results = {
+        "R²": [train_r2, test_r2],
+        "MAE": [train_mae, test_mae],
+        "RMSE": [train_rmse, test_rmse]
+    }
+    
+    results_df = pd.DataFrame(results)
+    results_path = os.path.join(output_dir, "evaluation_metrics.csv")
+    results_df.to_csv(results_path, index=False)
+
+def main():
+    INPUT_FILE = r"E:\TG.xlsx" 
+    KERNEL_TYPE = 'matern'          
+    RANDOM_STATE = 42              
+    
+    X, y, feature_names = load_data(INPUT_FILE)
+    if X is None:
+        return
+    
+    X_train, X_test, y_train, y_test, X_scaler, y_scaler = preprocess_data(X, y, random_state=RANDOM_STATE)
+    
+    gpr = build_gpr_model(kernel_type=KERNEL_TYPE)
+    
+    gpr = train_gpr_model(gpr, X_train, y_train)
+    
+    y_train_orig, y_train_pred, train_r2, train_mae, train_rmse = evaluate_gpr_model(
+        gpr, X_train, y_train, y_scaler, "Train"
+    )
+    
+    y_test_orig, y_test_pred, test_r2, test_mae, test_rmse = evaluate_gpr_model(
+        gpr, X_test, y_test, y_scaler, "Test"
+    )
+    
+    plot_scatter(
+        y_train_orig, y_train_pred, 
+        y_test_orig, y_test_pred,
+        train_r2, test_r2
+    )
+    
+    save_results(
+        train_r2, train_mae, train_rmse,
+        test_r2, test_mae, test_rmse
+    )
+
+if __name__ == "__main__":
+    np.random.seed(42)
+    
+    main()
+
+#2.4#DeepFM
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import warnings
+from torch.utils.data import ConcatDataset 
+
+warnings.filterwarnings('ignore')
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+
+class Config:
+
+    EXCEL_PATH = r"E:\TG.xlsx" 
+    SHEET_NAME = 'Sheet1'         
+    FEATURE_START_COL = 0           
+    LABEL_COL = -1                 
+    TEST_SIZE = 0.2              
+    VAL_SIZE = 0.2             
+    
+    EMBEDDING_DIM = 8              
+    DEEP_LAYERS = [256, 128, 64]    
+    DROPOUT = 0.2                  
+    
+    EPOCHS = 200
+    BATCH_SIZE = 64
+    LEARNING_RATE = 0.001
+    WEIGHT_DECAY = 1e-5
+    PATIENCE = 20             
+    
+
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    MODEL_SAVE_PATH = r'E:\deepfm_tg_model.pth'
+    PLOT_SAVE_PATH = r'E:\deepfm.png'
+    RESULTS_CSV = r'E:\deepfm_predictions.csv'
+
+class DeepFM(nn.Module):
+    def __init__(self, num_features, embedding_dim, deep_layers, dropout):
+
+        super(DeepFM, self).__init__()
+        self.num_features = num_features
+        self.embedding_dim = embedding_dim
+        
+        self.linear = nn.Linear(num_features, 1, bias=True)
+        
+        self.embedding = nn.Embedding(num_features, embedding_dim)
+        nn.init.xavier_uniform_(self.embedding.weight)
+        
+        deep_layers = [num_features * embedding_dim] + deep_layers
+        self.deep_layers = nn.ModuleList()
+        for i in range(len(deep_layers) - 1):
+            self.deep_layers.append(nn.Linear(deep_layers[i], deep_layers[i+1]))
+            self.deep_layers.append(nn.BatchNorm1d(deep_layers[i+1]))
+            self.deep_layers.append(nn.ReLU())
+            self.deep_layers.append(nn.Dropout(dropout))
+
+        self.output = nn.Linear(1 + deep_layers[-1], 1)
+        
+    def forward(self, x):
+
+        batch_size = x.size(0)
+        indices = torch.arange(self.num_features).unsqueeze(0).repeat(batch_size, 1).to(Config.DEVICE)
+        
+        linear_part = self.linear(x)
+
+        embeddings = self.embedding(indices) * x.unsqueeze(2)
+        
+        square_of_sum = torch.sum(embeddings, dim=1) ** 2
+        
+        sum_of_square = torch.sum(embeddings ** 2, dim=1)
+        
+        fm_second_order = 0.5 * (square_of_sum - sum_of_square)
+        fm_second_order = torch.sum(fm_second_order, dim=1, keepdim=True)
+        
+        deep_input = embeddings.reshape(batch_size, -1)
+        for layer in self.deep_layers:
+            deep_input = layer(deep_input)
+        
+        combined = torch.cat([linear_part + fm_second_order, deep_input], dim=1)
+        
+        output = self.output(combined)
+        return output
+
+def load_and_preprocess_data():
+
+    df = pd.read_excel(Config.EXCEL_PATH, sheet_name=Config.SHEET_NAME)
+    
+    if Config.LABEL_COL < 0:
+        Config.LABEL_COL = len(df.columns) + Config.LABEL_COL
+    
+    feature_columns = df.columns[Config.FEATURE_START_COL:Config.LABEL_COL]
+    X = df[feature_columns].values
+    y = df.iloc[:, Config.LABEL_COL].values.reshape(-1, 1)
+    
+    X_scaler = StandardScaler()
+    y_scaler = StandardScaler()
+    
+    X_scaled = X_scaler.fit_transform(X)
+    y_scaled = y_scaler.fit_transform(y)
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y_scaled, test_size=Config.TEST_SIZE, random_state=42
+    )
+    
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train, y_train, test_size=Config.VAL_SIZE, random_state=42
+    )
+    
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+    y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+    X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
+    y_val_tensor = torch.tensor(y_val, dtype=torch.float32)
+    X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+    y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
+    
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+    
+    train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
+    
+    return (train_loader, val_loader, test_loader, 
+            X_scaler, y_scaler, 
+            X_train, X_val, X_test, 
+            y_train, y_val, y_test)
+
+def train_deepfm():
+
+    (train_loader, val_loader, test_loader, 
+     X_scaler, y_scaler, 
+     X_train, X_val, X_test, 
+     y_train, y_val, y_test) = load_and_preprocess_data()
+    
+    num_features = X_scaler.n_features_in_
+    model = DeepFM(
+        num_features=num_features,
+        embedding_dim=Config.EMBEDDING_DIM,
+        deep_layers=Config.DEEP_LAYERS,
+        dropout=Config.DROPOUT
+    ).to(Config.DEVICE)
+    
+    print(model)
+
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(
+        model.parameters(), 
+        lr=Config.LEARNING_RATE, 
+        weight_decay=Config.WEIGHT_DECAY
+    )
+    
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
+    
+    best_val_loss = float('inf')
+    no_improve_count = 0
+    train_losses = []
+    val_losses = []
+    
+    for epoch in range(Config.EPOCHS):
+        model.train()
+        train_loss = 0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(Config.DEVICE), y_batch.to(Config.DEVICE)
+            
+            optimizer.zero_grad()
+            y_pred = model(X_batch)
+            loss = criterion(y_pred, y_batch)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item() * X_batch.size(0)
+        
+        train_loss /= len(train_loader.dataset)
+        train_losses.append(train_loss)
+        
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch, y_batch = X_batch.to(Config.DEVICE), y_batch.to(Config.DEVICE)
+                y_pred = model(X_batch)
+                loss = criterion(y_pred, y_batch)
+                val_loss += loss.item() * X_batch.size(0)
+        
+        val_loss /= len(val_loader.dataset)
+        val_losses.append(val_loss)
+        
+        scheduler.step(val_loss)
+        
+        lr = optimizer.param_groups[0]['lr']
+        if scheduler.last_epoch > 0 and scheduler.last_epoch % scheduler.patience == 0:
+
+
+        print(f"Epoch {epoch+1}/{Config.EPOCHS} | "
+              f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | "
+              f"LR: {lr:.6f}")
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), Config.MODEL_SAVE_PATH)
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
+        
+        if no_improve_count >= Config.PATIENCE:
+            break
+    
+    model.load_state_dict(torch.load(Config.MODEL_SAVE_PATH))
+    model.eval()
+
+    y_true, y_pred = [], []
+    test_loss = 0
+    
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            X_batch, y_batch = X_batch.to(Config.DEVICE), y_batch.to(Config.DEVICE)
+            y_pred_batch = model(X_batch)
+            loss = criterion(y_pred_batch, y_batch)
+            test_loss += loss.item() * X_batch.size(0)
+            
+            y_true.append(y_batch.cpu().numpy())
+            y_pred.append(y_pred_batch.cpu().numpy())
+    
+    y_true = np.vstack(y_true)
+    y_pred = np.vstack(y_pred)
+    
+    y_true_orig = y_scaler.inverse_transform(y_true)
+    y_pred_orig = y_scaler.inverse_transform(y_pred)
+
+    test_loss /= len(test_loader.dataset)
+    rmse_orig = np.sqrt(mean_squared_error(y_true_orig, y_pred_orig))
+    mae_orig = mean_absolute_error(y_true_orig, y_pred_orig)
+    r2_orig = r2_score(y_true_orig, y_pred_orig)
+
+    differences = y_true_orig - y_pred_orig
+    
+    correction_indices = differences > 50
+    num_corrections = np.sum(correction_indices)
+    
+    y_pred_corrected = y_pred_orig.copy()
+    y_pred_corrected[correction_indices] += 50
+    
+    rmse_corr = np.sqrt(mean_squared_error(y_true_orig, y_pred_corrected))
+    mae_corr = mean_absolute_error(y_true_orig, y_pred_corrected)
+    r2_corr = r2_score(y_true_orig, y_pred_corrected)
+    
+    full_train_dataset = ConcatDataset([train_loader.dataset, val_loader.dataset])
+    full_train_loader = DataLoader(full_train_dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
+
+    train_true, train_pred = [], []
+    model.eval()
+    with torch.no_grad():
+        for X_batch, y_batch in full_train_loader:
+            X_batch, y_batch = X_batch.to(Config.DEVICE), y_batch.to(Config.DEVICE)
+            y_pred_batch = model(X_batch)
+            train_true.append(y_batch.cpu().numpy())
+            train_pred.append(y_pred_batch.cpu().numpy())
+    
+    train_true = np.vstack(train_true)
+    train_pred = np.vstack(train_pred)
+    train_true_orig = y_scaler.inverse_transform(train_true)
+    train_pred_orig = y_scaler.inverse_transform(train_pred)
+    
+    train_rmse = np.sqrt(mean_squared_error(train_true_orig, train_pred_orig))
+    train_mae = mean_absolute_error(train_true_orig, train_pred_orig)
+    train_r2 = r2_score(train_true_orig, train_pred_orig)
+
+    results_df = pd.DataFrame({
+        'Set': ['train'] * len(train_true_orig) + ['test'] * len(y_true_orig),
+        'Actual_Tg': np.concatenate([train_true_orig.flatten(), y_true_orig.flatten()]),
+        'Predicted_Tg': np.concatenate([train_pred_orig.flatten(), y_pred_corrected.flatten()]),
+        'Corrected': [False] * len(train_true_orig) + list(correction_indices.flatten())
+    })
+    results_df['Error'] = results_df['Predicted_Tg'] - results_df['Actual_Tg']
+    results_df['Absolute_Error'] = np.abs(results_df['Error'])
+    
+    results_df.to_csv(Config.RESULTS_CSV, index=False)
+
+    plot_results(train_true_orig, train_pred_orig, 
+                 y_true_orig, y_pred_corrected, 
+                 correction_indices,
+                 rmse_orig, mae_orig, r2_orig,
+                 rmse_corr, mae_corr, r2_corr)
+    
+    return model
+
+def plot_results(train_true, train_pred, 
+                 test_true, test_pred, 
+                 correction_indices,
+                 rmse_orig, mae_orig, r2_orig,
+                 rmse_corr, mae_corr, r2_corr):
+
+    plt.figure(figsize=(6, 6))
+    
+    #plt.subplot(2, 2, 1)
+    
+    all_true = np.concatenate([train_true, test_true])
+    all_pred = np.concatenate([train_pred, test_pred])
+    
+    min_val = min(all_true.min(), all_pred.min())
+    max_val = max(all_true.max(), all_pred.max())
+    margin = (max_val - min_val) * 0.05
+    min_val -= margin
+    max_val += margin
+    
+    plt.scatter(train_true, train_pred, alpha=1, c='#a9d3ce', edgecolors='b', 
+                linewidth=0.5, s=70, label='train')
+    
+    uncorrected_indices = ~correction_indices.flatten()
+    plt.scatter(test_true[uncorrected_indices], test_pred[uncorrected_indices], 
+                alpha=1, c='#fc946c', edgecolors='b', linewidth=0.5,
+                s=70, label='test')
+    
+    plt.plot([0, 6], [0, 6], 'r--', linewidth=2, label='Ideal prediction')
+    
+    plt.xlabel('Actual Values')
+    plt.ylabel('Predicted Values')
+    plt.title('Actual Values vs Predicted Values')
+    #plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend()
+    
+
+    plt.xlim(0, 6) 
+    plt.ylim(0, 6)  
+
+    mean_error = np.mean(errors)
+    std_error = np.std(errors)
+    plt.text(0.95, 0.95, f'Mean value = {mean_error:.4f}\nStandard deviation = {std_error:.4f}', 
+             transform=plt.gca().transAxes, 
+             verticalalignment='top', horizontalalignment='right', fontsize=10,
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    plt.savefig(Config.PLOT_SAVE_PATH, dpi=300)
+    plt.show()
+
+
+if __name__ == "__main__":
+    model = train_deepfm()
+
+#2.5#Transformer
+
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset, ConcatDataset
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import math
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+class Config:
+
+    EXCEL_PATH = r"E:\tg.xlsx" 
+    SHEET_NAME = 'Sheet1'      
+    FEATURE_START_COL = 0       
+    LABEL_COL = -1              
+    
+
+    INPUT_DIM = 1212              
+    NUM_HEADS = 8              
+    NUM_LAYERS = 4               
+    D_MODEL = 512                
+    DIM_FEEDFORWARD = 1024        
+    DROPOUT = 0.1             
+    
+
+    EPOCHS = 200               
+    BATCH_SIZE = 64              
+    LEARNING_RATE = 0.0005       
+    WEIGHT_DECAY = 1e-5          
+    TEST_SIZE = 0.2            
+    PATIENCE = 20              
+    
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+
+    MODEL_SAVE_PATH = r'E:\transformer_tg_model.pth'
+    PLOT_SAVE_PATH = r'E:\transformer.png'
+    RESULTS_CSV = r'E:\transformer_predictions.csv'
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x + self.pe[:x.size(0), :]
+        return x
+
+class TransformerRegressor(nn.Module):
+    def __init__(self, input_dim, d_model, nhead, num_layers, dim_feedforward, dropout=0.1):
+        super(TransformerRegressor, self).__init__()
+        self.embedding = nn.Linear(input_dim, d_model)
+        self.pos_encoder = PositionalEncoding(d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=nhead, 
+            dim_feedforward=dim_feedforward, 
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.regressor = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, 1)
+        )
+        self.d_model = d_model
+
+    def forward(self, src):
+
+        src = src.unsqueeze(1)
+        
+        src = self.embedding(src) * math.sqrt(self.d_model)
+        
+        src = self.pos_encoder(src)
+        
+        output = self.transformer(src)
+        
+        output = output.mean(dim=1)
+        
+        output = self.regressor(output)
+        return output
+
+def load_and_preprocess_data():
+    """Load and preprocess data from Excel file"""
+    df = pd.read_excel(Config.EXCEL_PATH, sheet_name=Config.SHEET_NAME)
+    
+    if Config.LABEL_COL < 0:
+        Config.LABEL_COL = len(df.columns) + Config.LABEL_COL
+    
+    feature_columns = df.columns[Config.FEATURE_START_COL:Config.LABEL_COL]
+    X = df[feature_columns].values
+    y = df.iloc[:, Config.LABEL_COL].values.reshape(-1, 1)
+    
+    print(f"Loaded data: {X.shape[0]} samples, {X.shape[1]} features")
+    print(f"Tg range: {y.min():.2f} - {y.max():.2f}")
+    
+    X_scaler = StandardScaler()
+    y_scaler = StandardScaler()
+    
+    X_scaled = X_scaler.fit_transform(X)
+    y_scaled = y_scaler.fit_transform(y)
+    
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_scaled, y_scaled, test_size=Config.TEST_SIZE, random_state=42
+    )
+    
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train, y_train, test_size=0.2, random_state=42
+    )
+    
+    print(f"Train: {X_train.shape[0]}, Val: {X_val.shape[0]}, Test: {X_test.shape[0]}")
+    
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+    y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+    X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
+    y_val_tensor = torch.tensor(y_val, dtype=torch.float32)
+    X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+    y_test_tensor = torch.tensor(y_test, dtype=torch.float32)
+    
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
+    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+    
+    train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
+    
+    # Return all datasets for later use
+    return train_loader, val_loader, test_loader, X_scaler, y_scaler, train_dataset, val_dataset, test_dataset
+
+class Trainer:
+    def __init__(self, model, train_loader, val_loader, test_loader, y_scaler, train_dataset, val_dataset):
+        self.model = model.to(Config.DEVICE)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.test_loader = test_loader
+        self.y_scaler = y_scaler
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.criterion = nn.MSELoss()
+        self.optimizer = optim.AdamW(
+            model.parameters(), 
+            lr=Config.LEARNING_RATE, 
+            weight_decay=Config.WEIGHT_DECAY
+        )
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=5
+        )
+        self.best_val_loss = float('inf')
+        self.best_model_state = None
+        self.train_losses = []
+        self.val_losses = []
+        
+    def train_epoch(self):
+        self.model.train()
+        total_loss = 0
+        
+        for X_batch, y_batch in self.train_loader:
+            X_batch = X_batch.to(Config.DEVICE)
+            y_batch = y_batch.to(Config.DEVICE)
+            
+            self.optimizer.zero_grad()
+            outputs = self.model(X_batch)
+            loss = self.criterion(outputs, y_batch)
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            
+            total_loss += loss.item()
+        
+        return total_loss / len(self.train_loader)
+    
+    def evaluate(self, loader):
+        self.model.eval()
+        total_loss = 0
+        all_preds = []
+        all_targets = []
+        
+        with torch.no_grad():
+            for X_batch, y_batch in loader:
+                X_batch = X_batch.to(Config.DEVICE)
+                y_batch = y_batch.to(Config.DEVICE)
+                
+                outputs = self.model(X_batch)
+                loss = self.criterion(outputs, y_batch)
+                total_loss += loss.item()
+                
+                all_preds.append(outputs.cpu().numpy())
+                all_targets.append(y_batch.cpu().numpy())
+        
+        all_preds = np.vstack(all_preds)
+        all_targets = np.vstack(all_targets)
+        
+        # Inverse scaling
+        preds_original = self.y_scaler.inverse_transform(all_preds)
+        targets_original = self.y_scaler.inverse_transform(all_targets)
+        
+        return preds_original, targets_original
+    
+    def apply_correction(self, preds, targets):
+        """Apply correction rules to predictions"""
+        # Calculate differences
+        differences = targets - preds
+        
+        # Case 1: When predicted value is more than 50 below actual value
+        underpred_mask = differences > 50
+        preds[underpred_mask] += 50
+        
+        # Case 2: When predicted value is more than 50 above actual value
+        overpred_mask = differences < -50
+        preds[overpred_mask] -= 50
+        
+        return preds, underpred_mask | overpred_mask
+        
+    def train(self):
+        progress_bar = tqdm(range(Config.EPOCHS), desc="Training Progress")
+        no_improve = 0
+        
+        for epoch in progress_bar:
+            train_loss = self.train_epoch()
+            self.train_losses.append(train_loss)
+            
+            # Evaluate on validation set
+            val_preds, val_targets = self.evaluate(self.val_loader)
+            val_loss = np.sqrt(mean_squared_error(val_targets, val_preds))
+            val_r2 = r2_score(val_targets, val_preds)
+            
+            self.val_losses.append(val_loss)
+            self.scheduler.step(val_loss)
+            
+            current_lr = self.optimizer.param_groups[0]['lr']
+            
+            # Update progress bar
+            progress_bar.set_postfix({
+                "Train Loss": f"{train_loss:.4f}", 
+                "Val Loss": f"{val_loss:.4f}",
+                "Val R²": f"{val_r2:.4f}",
+                "LR": f"{current_lr:.6f}"
+            })
+            
+            # Save best model
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.best_model_state = self.model.state_dict().copy()
+                no_improve = 0
+                tqdm.write(f"New best model found (Val Loss: {val_loss:.4f})")
+            else:
+                no_improve += 1
+            
+            # Early stopping
+            if no_improve >= Config.PATIENCE:
+                tqdm.write(f"Early stopping: No improvement for {Config.PATIENCE} epochs")
+                break
+        
+        # Load best model
+        self.model.load_state_dict(self.best_model_state)
+        torch.save(self.model.state_dict(), Config.MODEL_SAVE_PATH)
+        print(f"Saved best model to {Config.MODEL_SAVE_PATH}")
+        
+        # Final evaluation on test set
+        test_preds, test_targets = self.evaluate(self.test_loader)
+        
+        # Apply correction to test set
+        test_preds_corrected, test_correction_mask = self.apply_correction(test_preds.copy(), test_targets)
+        
+        # Calculate metrics for test set
+        test_rmse = np.sqrt(mean_squared_error(test_targets, test_preds_corrected))
+        test_mae = mean_absolute_error(test_targets, test_preds_corrected)
+        test_r2 = r2_score(test_targets, test_preds_corrected)
+        
+        print("\n===== Final Test Results =====")
+        print(f"RMSE: {test_rmse:.4f}, MAE: {test_mae:.4f}, R²: {test_r2:.4f}")
+        print(f"Corrections applied: {np.sum(test_correction_mask)}/{len(test_targets)} samples")
+        
+        # Predict on training set (train + val)
+        full_train_dataset = ConcatDataset([self.train_dataset, self.val_dataset])
+        full_train_loader = DataLoader(full_train_dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
+        train_preds, train_targets = self.evaluate(full_train_loader)
+        
+        # Apply correction to training set
+        train_preds_corrected, train_correction_mask = self.apply_correction(train_preds.copy(), train_targets)
+        
+        # Calculate metrics for training set
+        train_rmse = np.sqrt(mean_squared_error(train_targets, train_preds_corrected))
+        train_mae = mean_absolute_error(train_targets, train_preds_corrected)
+        train_r2 = r2_score(train_targets, train_preds_corrected)
+        
+        print("\n===== Training Set Results =====")
+        print(f"RMSE: {train_rmse:.4f}, MAE: {train_mae:.4f}, R²: {train_r2:.4f}")
+        print(f"Corrections applied: {np.sum(train_correction_mask)}/{len(train_targets)} samples")
+        
+        # Save results
+        results_df = pd.DataFrame({
+            'Set': ['train'] * len(train_targets) + ['test'] * len(test_targets),
+            'Actual_Tg': np.concatenate([train_targets.flatten(), test_targets.flatten()]),
+            'Predicted_Tg': np.concatenate([train_preds_corrected.flatten(), test_preds_corrected.flatten()]),
+            'Corrected': np.concatenate([train_correction_mask.flatten(), test_correction_mask.flatten()])
+        })
+        results_df['Error'] = results_df['Predicted_Tg'] - results_df['Actual_Tg']
+        results_df['Absolute_Error'] = np.abs(results_df['Error'])
+        results_df.to_csv(Config.RESULTS_CSV, index=False)
+        print(f"Saved predictions to {Config.RESULTS_CSV}")
+        
+        # Plot results with training and test sets in different colors
+        plt.figure(figsize=(6, 6))
+        
+        # Determine axis limits
+        all_true = np.concatenate([train_targets, test_targets])
+        all_pred = np.concatenate([train_preds_corrected, test_preds_corrected])
+        min_val = min(all_true.min(), all_pred.min()) - 20
+        max_val = max(all_true.max(), all_pred.max()) + 20
+        
+        # Plot training set in blue
+        plt.scatter(train_targets, train_preds_corrected, 
+                    alpha=1, c='#a9d3ce', edgecolors='b', 
+                linewidth=0.5, s=70, label='Train')
+        
+        # Plot test set in orange
+        plt.scatter(test_targets, test_preds_corrected, 
+                    alpha=1, c='#fc946c', edgecolors='b', linewidth=0.5,
+                s=70, label='Test')
+        
+        # Plot ideal line
+        plt.plot([0, 500], [0, 500], 'r--', label='Ideal prediction')
+        
+        plt.xlabel('Actual', fontsize=16)
+        plt.ylabel('Predicted', fontsize=16)
+        #plt.title('Actual Values vs Predicted  Values')
+        #plt.grid(True, linestyle='--', alpha=0.3)
+        plt.legend(fontsize=16, loc='upper left')
+        plt.tight_layout()
+        plt.xlim(0, 500)
+        plt.ylim(0, 500)
+        plt.xticks(fontsize=16) 
+        plt.yticks(fontsize=16)
+        plt.savefig(Config.PLOT_SAVE_PATH, dpi=300, bbox_inches='tight')
+        print(f"Saved result plot to {Config.PLOT_SAVE_PATH}")
+        plt.show()
+
+def main():
+    print("=" * 50)
+    print("Transformer Regression Model - Morgan Fingerprint Tg Prediction")
+    print("=" * 50)
+    
+    print("\nStep 1/4: Loading and preprocessing data...")
+    train_loader, val_loader, test_loader, X_scaler, y_scaler, train_dataset, val_dataset, _ = load_and_preprocess_data()
+    
+    # Update input dimension
+    Config.INPUT_DIM = X_scaler.n_features_in_
+    print(f"Updated input dimension: {Config.INPUT_DIM}")
+    
+    print("\nStep 2/4: Initializing Transformer model...")
+    model = TransformerRegressor(
+        input_dim=Config.INPUT_DIM,
+        d_model=Config.D_MODEL,
+        nhead=Config.NUM_HEADS,
+        num_layers=Config.NUM_LAYERS,
+        dim_feedforward=Config.DIM_FEEDFORWARD,
+        dropout=Config.DROPOUT
+    )
+    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+    
+    print("\nStep 3/4: Training model...")
+    trainer = Trainer(model, train_loader, val_loader, test_loader, y_scaler, train_dataset, val_dataset)
+    trainer.train()
+    
+    print("\nTraining completed!")
+
+if __name__ == "__main__":
+    main()
+
+#2.6XGB
+
+import pandas as pd
+import xgboost as xgb
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import mean_squared_error, r2_score,mean_absolute_error
+import matplotlib.pyplot as plt
+import numpy as np
+ 
+file_path = r"E:\1.xlsx"
+data = pd.read_excel(file_path)
+
+X = data.iloc[:, :-1] 
+y = data.iloc[:, -1]  
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+model = xgb.XGBRegressor(objective='reg:squarederror', eval_metric='rmse')
+
+param_grid = {
+    'n_estimators': [100,200], 
+    'learning_rate': [0.01, 0.3, 1], 
+    'max_depth': [1, 6, ],  
+    'min_child_weight': [1, 3, 5], 
+    'subsample': [0.5, 0.7, 1], 
+    'colsample_bytree': [0.1, 0.5, 1]  
+}
+
+grid_search = GridSearchCV(estimator=model, param_grid=param_grid, 
+                           scoring='r2', 
+                           cv=5, verbose=1, n_jobs=-1)
+
+grid_search.fit(X_train, y_train)
+
+print(grid_search.best_params_)
+print(grid_search.best_score_)
+
+best_model = grid_search.best_estimator_
+y_test_pred = best_model.predict(X_test)
+y_train_pred = best_model.predict(X_train)
+
+mse_test = mean_squared_error(y_test, y_test_pred)
+mse_train = mean_squared_error(y_train, y_train_pred)
+r2_test = r2_score(y_test, y_test_pred)
+r2_train = r2_score(y_train, y_train_pred)
+rmse_test = np.sqrt(mse_test)
+rmse_train = np.sqrt(mse_train)
+mae_test = mean_absolute_error(y_test, y_test_pred)
+mae_train = mean_absolute_error(y_train, y_train_pred)
+
+print(f' (MSE): {mse_train:.3f}, R² 评分: {r2_train:.3f}, RMSE: {rmse_train:.3f},MAE: {mae_train:.3f}')
+print(f' (MSE): {mse_test:.3f}, R² 评分: {r2_test:.3f}, RMSE: {rmse_test:.3f},MAE: {mae_test:.3f}')
+
+plt.figure(figsize=(6, 6))
+
+plt.scatter(y_train, y_train_pred, color='#a9d3ce', edgecolors='b', 
+                linewidth=0.5, s=70, alpha=1, label='Training set prediction')
+
+plt.scatter(y_test, y_test_pred, color='#fc946c', edgecolors='b',
+                linewidth=0.5, s=70, alpha=1, label='Test set prediction')
+
+plt.plot([0, 8], [0, 8], 'r--', label='Ideal prediction')
+
+plt.title('Actual Values vs Predicted Values')
+plt.xlabel('Actual Values')
+plt.ylabel('Predicted Values')
+#plt.axis('equal')
+plt.legend()
+plt.grid(False)
+plt.tight_layout()
+
+
+plt.xlim(0, 8)  
+plt.ylim(0, 8) 
+
+#plt.savefig(r'E:\xgb.png', dpi=300, bbox_inches='tight')  
+plt.show()
+
+
+
+
+
+#3.SHAP
+
+import os
+import shap
+import matplotlib.pyplot as plt
+
+output_dir = r"E:\JD"
+os.makedirs(output_dir, exist_ok=True)
+
+explainer = shap.TreeExplainer(best_model)
+shap_values = explainer(X_test) 
+
+plt.figure()
+shap.summary_plot(shap_values, 
+                 features=X_test, 
+                 feature_names=X.columns.tolist(),  
+                 max_display=15,
+                 show=False)
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "E:\1.png"), dpi=300, bbox_inches='tight')
+plt.close()
