@@ -1,0 +1,19 @@
+import os
+import shap
+import matplotlib.pyplot as plt
+
+output_dir = r"E:\JD"
+os.makedirs(output_dir, exist_ok=True)
+
+explainer = shap.TreeExplainer(best_model)
+shap_values = explainer(X_test) 
+
+plt.figure()
+shap.summary_plot(shap_values, 
+                 features=X_test, 
+                 feature_names=X.columns.tolist(),  
+                 max_display=15,
+                 show=False)
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "E:\1.png"), dpi=300, bbox_inches='tight')
+plt.close()
